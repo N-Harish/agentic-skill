@@ -13,18 +13,34 @@ A successful build proves little. The job is done only when the container has be
 
 ## Rules
 
+- Never work on the user's current branch: all Dockerfile changes, builds and tests happen on a new branch (step 1).
 - Never overwrite an existing `Dockerfile` or `.dockerignore`: review it and propose changes.
 - Never put secrets in an image (`ENV`, `ARG`, `COPY .env`). Use runtime env vars or `RUN --mount=type=secret`.
 - No `--privileged`, no docker.sock mounts, no `docker system prune`, no `docker push` unless asked. Only remove containers you created (label `skill=docker-build`).
 - Don't edit application source without saying why. Pin base image tags and install from lockfiles.
 
-## 1. Preflight
+## 1. Preflight and safe branch
 
 ```bash
 docker version --format '{{.Server.Version}}'   # daemon reachable? if not: stop and tell the user
 git rev-parse --show-toplevel && git status --porcelain
+git branch --show-current                        # remember this as ORIG_BRANCH for the report
 ```
-Build context = repo root (monorepo: use `-f path/Dockerfile` from the root). Not a git repo: continue, use a timestamp tag, say so in the report.
+
+**Before creating or changing any file, switch to a new branch.** Use the name the user gave; otherwise `docker/containerize-$(date +%Y%m%d-%H%M)`.
+
+```bash
+git switch -c "$NEW_BRANCH"      # plain `git switch <name>` fails for a branch that doesn't exist yet; -c creates it
+git branch --show-current        # confirm you are on $NEW_BRANCH before continuing
+```
+
+- If the name already exists, don't reuse it: pick another suffix.
+- Uncommitted changes in the working tree come along to the new branch and are not lost. Mention this if the tree is dirty (the tag will end in `-dirty`; it will also be `-dirty` once the new Dockerfile exists uncommitted, which is expected).
+- Detached HEAD: the same command works and branches from the current commit.
+- Do not commit, push, merge, or switch back unless the user asks. Leave the branch checked out so they can review with `git status` (new files are untracked, so `git diff` alone won't show them).
+- Not a git repo: skip the branch, warn that there is no safety net, use a timestamp tag, and say so in the report.
+
+Build context = repo root (monorepo: use `-f path/Dockerfile` from the root).
 
 ## 2. Analyze (answer from the code, cite the file)
 
@@ -176,10 +192,11 @@ Lead with the verdict, keep it short:
 
 ```
 Result: PASS | PASS with warnings | FAIL
+Branch: docker/containerize-20261009-1030 (from main; nothing committed)
 Image:  myapp:3f2a9c1d8e4b-dirty (+ latest), 142 MB; stages: deps/build/test/prod-deps/runtime
 Checks: build PASS | non-root PASS | no secrets/.git PASS | GET /healthz -> 200 in 3s PASS | graceful stop 1s PASS
 Files created: Dockerfile, .dockerignore
 Assumptions: port 3000 from src/server.ts:12; no DB needed to boot
 Run:    docker run --rm -p 3000:3000 --env-file .env myapp:latest
 ```
-Mention anything the user must supply (real env vars) and that a `-dirty` tag means uncommitted changes were built.
+Include how to review or discard: `git status` to review, `git switch main && git branch -D docker/containerize-20261009-1030` to throw it away (only the user decides; don't run it). Mention anything the user must supply (real env vars) and that a `-dirty` tag means uncommitted changes were built.
