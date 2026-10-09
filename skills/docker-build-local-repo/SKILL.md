@@ -38,6 +38,7 @@ git branch --show-current        # confirm you are on $NEW_BRANCH before continu
 - Uncommitted changes in the working tree come along to the new branch and are not lost. Mention this if the tree is dirty (the tag will end in `-dirty`; it will also be `-dirty` once the new Dockerfile exists uncommitted, which is expected).
 - Detached HEAD: the same command works and branches from the current commit.
 - Do not commit, push, merge, or switch back unless the user asks. Leave the branch checked out so they can review with `git status` (new files are untracked, so `git diff` alone won't show them).
+- Repo with **no commits yet** (`git rev-parse --verify -q HEAD` fails): a new branch cannot exist without a commit (`git branch` will not list it, and `git branch <x>` errors with "not a valid object name"). **Stop and ask the user** whether to create a baseline commit of the existing files on the current branch (show `git status` first and exclude junk like `.venv`, `.opencode/`). Only after they agree: commit, then `git switch -c "$NEW_BRANCH"`. If they decline, skip the branch, list every file you create so they can delete them, use a timestamp tag, and say there is no safety net. To list branches use `git branch` or `git branch -a`, never `git branch ls`.
 - Not a git repo: skip the branch, warn that there is no safety net, use a timestamp tag, and say so in the report.
 
 Build context = repo root (monorepo: use `-f path/Dockerfile` from the root).
@@ -58,7 +59,7 @@ Find: build step? entrypoint, listening port (grep `listen(`, `PORT`, `app.run(`
 
 ## 3. `.dockerignore` first
 
-Write it before the Dockerfile. Always exclude: `.git`, `.env`, `.env.*` (keep `!.env.example`), `*.pem`, `*.key`, `id_rsa*`, `node_modules`, `__pycache__`, `.venv`, `target`, `bin`/`obj`, `dist`/`build` (if rebuilt in image), `.idea`, `.vscode`, `*.log`, `coverage`, `Dockerfile*`, `docker-compose*`. Never ignore the lockfile.
+Write it before the Dockerfile. Always exclude: `.git`, `.env`, `.env.*` (keep `!.env.example`), `*.key`, `*.p12`, `id_rsa*` (not every `*.pem` is a secret, base images ship public CA `.pem` files), `node_modules`, `__pycache__`, `.venv`, `target`, `bin`/`obj`, `dist`/`build` (if rebuilt in image), `.idea`, `.vscode`, `*.log`, `coverage`, `Dockerfile*`, `docker-compose*`. Never ignore the lockfile.
 
 ## 4. Dockerfile: multi-stage wherever possible
 
@@ -67,7 +68,7 @@ Anything needed to build or test but not to run (compilers, dev deps, source, ca
 - Compiled or bundled (Go, Rust, Java, .NET, TypeScript): `build` → `runtime`.
 - Native deps (Python wheels, Ruby gems): compilers and `-dev` headers in `builder`; runtime gets only shared libs.
 - Interpreted with no build: still `deps` → `runtime`.
-- Tests exist: add a `test` stage (`docker build --target test .`), not shipped.
+- Tests exist (`tests/`, `pytest.ini`, a `test` script, `*_test.go`...): add a `test` stage (`docker build --target test .`), not shipped. Don't put `tests/` in `.dockerignore` in that case.
 - Frontend + backend: one named stage per toolchain, copy artifacts into one runtime.
 - Single stage only when nothing needs separating (e.g. plain static files); say so in the report.
 
@@ -135,14 +136,14 @@ If a Dockerfile already exists, don't rewrite it: build it, then report problems
 
 ```bash
 NAME=$(basename "$PWD" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._\n-' '-')
-if git rev-parse --git-dir >/dev/null 2>&1; then
+if git rev-parse --verify -q HEAD >/dev/null 2>&1; then   # needs at least one commit
   TAG="$NAME:$(git rev-parse --short=12 HEAD)$([ -n "$(git status --porcelain)" ] && echo -dirty)"
 else TAG="$NAME:local-$(date -u +%Y%m%d%H%M%S)"; fi
 docker build --pull --label skill=docker-build \
   --label "org.opencontainers.image.revision=$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
   -t "$TAG" -t "$NAME:latest" .
 ```
-If a `test` stage exists, run `docker build --target test .` first; a failing suite stops the workflow. Private deps: `--secret id=npmrc,src=$HOME/.npmrc`. Target another arch: `docker buildx build --platform linux/amd64 --load`.
+If the repo has tests, there must be a `test` stage; run `docker build --target test .` first and show the result; a failing suite stops the workflow. Private deps: `--secret id=npmrc,src=$HOME/.npmrc`. Target another arch: `docker buildx build --platform linux/amd64 --load`.
 
 On build failure, read the error, fix, retry (max 3 attempts, then report). Common: `COPY` file not found → `.dockerignore` excluded it; lockfile mismatch → report it, don't swap to `npm install`; missing system lib → install in build stage only; `exec format error` → wrong `--platform`; runtime `module not found` → artifact not copied to `runtime`.
 
@@ -154,8 +155,14 @@ Pick the mode from step 2. Use throwaway env values (`.env.example`); if a real 
 ```bash
 docker image inspect "$TAG" -f 'size={{.Size}} user={{.Config.User}}'   # user must be non-empty, not root/0
 docker history --no-trunc "$TAG" | grep -Ei '(SECRET|PASSWORD|TOKEN|API_?KEY)[A-Z_]*=' && echo "FAIL: secret in history"
-C=$(docker create "$TAG"); docker export "$C" | tar -t | grep -E '(^|/)\.git/|(^|/)\.env$|id_(rsa|ed25519)$|\.pem$' && echo "FAIL: sensitive file in image"; docker rm "$C" >/dev/null
+C=$(docker create "$TAG"); docker export "$C" | tar -t > /tmp/fs.txt; docker rm "$C" >/dev/null
+# Ignore public CA bundles shipped with the OS/Python (etc/ssl, certifi, ca-certificates): they are not secrets.
+HITS=$(grep -vE '^(etc/ssl/|usr/lib/ssl/|usr/share/ca-certificates/)|/certifi/' /tmp/fs.txt \
+  | grep -E '(^|/)\.git/|(^|/)\.env$|(^|/)id_(rsa|ecdsa|ed25519)$|\.(key|p12|pfx)$|(priv|private)[^/]*\.pem$' | head -10)
+if [ -n "$HITS" ]; then echo "FAIL: sensitive file in image:"; echo "$HITS"; else echo "PASS: no sensitive files"; fi
 ```
+
+If any static check prints FAIL, look at the listed paths: decide whether each is a real secret or a false positive, and say which in the report. Never end with PASS while an unexplained FAIL is on screen.
 
 **Server** (set `PORT`, `HP`, expected `200`)
 ```bash
@@ -192,7 +199,7 @@ Lead with the verdict, keep it short:
 
 ```
 Result: PASS | PASS with warnings | FAIL
-Branch: docker/containerize-20261009-1030 (from main; nothing committed)
+Branch: docker/containerize-20261009-1030 (from main; nothing committed; or: repo had no commits, so no original branch)
 Image:  myapp:3f2a9c1d8e4b-dirty (+ latest), 142 MB; stages: deps/build/test/prod-deps/runtime
 Checks: build PASS | non-root PASS | no secrets/.git PASS | GET /healthz -> 200 in 3s PASS | graceful stop 1s PASS
 Files created: Dockerfile, .dockerignore
